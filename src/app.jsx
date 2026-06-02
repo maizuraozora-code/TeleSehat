@@ -7,8 +7,13 @@ import {
   FileSignature, Pill, TrendingUp, AlertCircle,
   ShoppingCart, Store, Minus, Trash2, Receipt, Package,
   CreditCard, Wallet, Banknote, Mic, MicOff, Camera, 
-  VideoOff, PhoneOff, Send
+  VideoOff, PhoneOff, Send, Settings
 } from 'lucide-react';
+import { auth, db } from './firebase';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDocs, onSnapshot, collection, updateDoc, deleteDoc, addDoc, query, where } from 'firebase/firestore';
+
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
 const INITIAL_DOCTORS = [
   { id: 'd1', username: 'dr.andi', email: 'andi@telesehat.com', password: 'password123', name: 'dr. Andi Pratama', spec: 'Dokter Umum', rating: 4.8, img: 'https://api.dicebear.com/7.x/avataaars/svg?seed=Andi', phone: '081234567890' },
@@ -44,60 +49,154 @@ const formatRupiah = (number) => {
 };
 
 export default function App() {
+  const [firebaseUser, setFirebaseUser] = useState(null);
   const [currentUser, setCurrentUser] = useState(null);
   
-  const [patients, setPatients] = useState(INITIAL_PATIENTS);
-  const [doctors, setDoctors] = useState(INITIAL_DOCTORS);
-  const [appointments, setAppointments] = useState(INITIAL_APPOINTMENTS);
-  const [medicines, setMedicines] = useState(INITIAL_MEDICINES);
+  const [allUsers, setAllUsers] = useState([]);
+  const [appointments, setAppointments] = useState([]);
+  const [medicines, setMedicines] = useState([]);
   const [pharmacyOrders, setPharmacyOrders] = useState([]);
+  const [isLoadingDb, setIsLoadingDb] = useState(true);
 
-  const handleLogin = (role, userData) => setCurrentUser({ role, ...userData });
+  useEffect(() => {
+    const initAuth = async () => {
+      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        await signInWithCustomToken(auth, __initial_auth_token);
+      } else {
+        await signInAnonymously(auth);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setFirebaseUser);
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!firebaseUser) return;
+
+    const bootstrapFirebase = async () => {
+      try {
+        const usersRef = collection(db, 'artifacts', appId, 'public', 'data', 'tele_users');
+        const snap = await getDocs(usersRef);
+        
+        // Jika database masih kosong, suntikkan data awal (Dummy Data)
+        if (snap.empty) {
+          const promises = [];
+          INITIAL_DOCTORS.forEach(d => promises.push(setDoc(doc(usersRef, d.id), { ...d, role: 'doctor' })));
+          INITIAL_PATIENTS.forEach(p => promises.push(setDoc(doc(usersRef, p.id), { ...p, role: 'patient' })));
+          MOCK_ADMINS.forEach(a => promises.push(setDoc(doc(usersRef, a.id), { ...a, role: 'admin' })));
+          
+          const medRef = collection(db, 'artifacts', appId, 'public', 'data', 'tele_medicines');
+          INITIAL_MEDICINES.forEach(m => promises.push(setDoc(doc(medRef, m.id), m)));
+          
+          const apptRef = collection(db, 'artifacts', appId, 'public', 'data', 'tele_appointments');
+          INITIAL_APPOINTMENTS.forEach(a => promises.push(setDoc(doc(apptRef, a.id), a)));
+          
+          await Promise.all(promises);
+        }
+      } catch (e) {
+        console.error("Error bootstrapping data: ", e);
+      } finally {
+        setIsLoadingDb(false);
+      }
+    };
+    bootstrapFirebase();
+  }, [firebaseUser]);
+
+  useEffect(() => {
+    if (!firebaseUser) return;
+
+    const unsubUsers = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'tele_users'), (snap) => setAllUsers(snap.docs.map(d => d.data())), console.error);
+    const unsubAppts = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'tele_appointments'), (snap) => setAppointments(snap.docs.map(d => d.data())), console.error);
+    const unsubMeds = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'tele_medicines'), (snap) => setMedicines(snap.docs.map(d => d.data())), console.error);
+    const unsubOrders = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'tele_pharmacyOrders'), (snap) => setPharmacyOrders(snap.docs.map(d => d.data())), console.error);
+
+    return () => { unsubUsers(); unsubAppts(); unsubMeds(); unsubOrders(); };
+  }, [firebaseUser]);
+
+  useEffect(() => {
+    if (!firebaseUser || allUsers.length === 0) return;
+    const sessionRef = doc(db, 'artifacts', appId, 'users', firebaseUser.uid, 'tele_session', 'current');
+    
+    const unsubSession = onSnapshot(sessionRef, (snap) => {
+      if (snap.exists()) {
+        const logicalId = snap.data().logicalUserId;
+        const user = allUsers.find(u => u.id === logicalId);
+        setCurrentUser(user || null);
+      } else {
+        setCurrentUser(null);
+      }
+    }, console.error);
+    
+    return () => unsubSession();
+  }, [firebaseUser, allUsers]);
+
+  const handleLogin = async (role, userData) => {
+    if (!firebaseUser) return;
+    await setDoc(doc(db, 'artifacts', appId, 'users', firebaseUser.uid, 'tele_session', 'current'), { logicalUserId: userData.id });
+  };
   
-  const handleRegister = (role, newUserData) => {
-    if (role === 'patient') setPatients([...patients, newUserData]);
-    else if (role === 'doctor') setDoctors([...doctors, newUserData]);
-    setCurrentUser({ role, ...newUserData });
+  const handleRegister = async (role, newUserData) => {
+    if (!firebaseUser) return;
+    const id = `${role.charAt(0)}${Date.now()}`;
+    const userToSave = { ...newUserData, id, role };
+    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tele_users', id), userToSave);
+    await handleLogin(role, userToSave);
   };
 
-  const handleLogout = () => setCurrentUser(null);
-
-  // Fungsi Transaksi Pasien
-  const addAppointment = (newAppt) => {
-    setAppointments([...appointments, { ...newAppt, id: `a${Date.now()}`, diagnosis: '', prescription: '' }]);
+  const handleLogout = async () => {
+    if (!firebaseUser) return;
+    await deleteDoc(doc(db, 'artifacts', appId, 'users', firebaseUser.uid, 'tele_session', 'current'));
   };
 
-  const addPharmacyOrder = (orderData) => {
-    setPharmacyOrders([...pharmacyOrders, { ...orderData, id: `ord${Date.now()}` }]);
+  const addAppointment = async (newAppt) => {
+    const id = `a${Date.now()}`;
+    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tele_appointments', id), { ...newAppt, id, diagnosis: '', prescription: '' });
   };
 
-  // Fungsi Persetujuan Admin
-  const approveAppointment = (apptId) => {
-    setAppointments(appointments.map(appt => 
-      appt.id === apptId ? { ...appt, status: 'upcoming' } : appt
-    ));
+  const addPharmacyOrder = async (orderData) => {
+    const id = `ord${Date.now()}`;
+    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tele_pharmacyOrders', id), { ...orderData, id });
   };
 
-  const approvePharmacyOrder = (orderId) => {
-    setPharmacyOrders(pharmacyOrders.map(order => 
-      order.id === orderId ? { ...order, status: 'Diproses' } : order
-    ));
+  const approveAppointment = async (apptId) => {
+    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tele_appointments', apptId), { status: 'upcoming' });
   };
 
-  // Fungsi Transaksi Dokter
-  const completeAppointment = (apptId, diagnosis, prescription) => {
-    setAppointments(appointments.map(appt => 
-      appt.id === apptId ? { ...appt, status: 'completed', diagnosis, prescription } : appt
-    ));
+  const approvePharmacyOrder = async (orderId) => {
+    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tele_pharmacyOrders', orderId), { status: 'Diproses' });
   };
+
+  const updateUserProfile = async (userId, updatedData) => {
+    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tele_users', userId), updatedData);
+  };
+
+  const completeAppointment = async (apptId, diagnosis, prescription) => {
+    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tele_appointments', apptId), { status: 'completed', diagnosis, prescription });
+  };
+
+  const patients = allUsers.filter(u => u.role === 'patient');
+  const doctors = allUsers.filter(u => u.role === 'doctor');
+  const admins = allUsers.filter(u => u.role === 'admin');
+
+  if (isLoadingDb) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50">
+        <div className="animate-pulse text-blue-600 flex flex-col items-center">
+          <Activity className="w-12 h-12 mb-4 animate-spin" />
+          <p className="font-semibold">Menghubungkan ke Cloud Server...</p>
+        </div>
+      </div>
+    );
+  }
 
   if (!currentUser) {
-    return <LoginPage onLogin={handleLogin} onRegister={handleRegister} patients={patients} doctors={doctors} admins={MOCK_ADMINS} />;
+    return <LoginPage onLogin={handleLogin} onRegister={handleRegister} patients={patients} doctors={doctors} admins={admins} />;
   }
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-800">
-      <Navbar user={currentUser} onLogout={handleLogout} />
+      <Navbar user={currentUser} onLogout={handleLogout} onUpdateProfile={updateUserProfile} />
       <main className="container mx-auto px-4 py-8">
         {currentUser.role === 'patient' && (
           <PatientDashboard 
@@ -133,9 +232,11 @@ export default function App() {
   );
 }
 
-function Navbar({ user, onLogout }) {
+function Navbar({ user, onLogout, onUpdateProfile }) {
+  const [showProfile, setShowProfile] = useState(false);
   const roleLabel = { patient: 'Pasien', doctor: 'Dokter', admin: 'Administrator' };
   return (
+    <>
     <nav className="bg-blue-600 text-white shadow-md sticky top-0 z-40">
       <div className="container mx-auto px-4 py-3 flex justify-between items-center">
         <div className="flex items-center space-x-2"><Activity className="h-6 w-6" /><span className="text-xl font-bold tracking-wide">TeleSehat</span></div>
@@ -145,10 +246,13 @@ function Navbar({ user, onLogout }) {
             <p className="text-xs text-blue-200">{roleLabel[user.role]}</p>
           </div>
           <img src={user.img} alt="avatar" className="h-10 w-10 rounded-full bg-white border-2 border-blue-400 object-cover" />
+          <button onClick={() => setShowProfile(true)} className="p-2 bg-blue-700/50 hover:bg-blue-800 rounded-full transition-colors" title="Pengaturan Profil"><Settings className="h-5 w-5" /></button>
           <button onClick={onLogout} className="p-2 bg-blue-700/50 hover:bg-blue-800 rounded-full transition-colors" title="Keluar"><LogOut className="h-5 w-5" /></button>
         </div>
       </div>
     </nav>
+    {showProfile && <EditProfileModal user={user} onClose={() => setShowProfile(false)} onSave={onUpdateProfile} />}
+    </>
   );
 }
 
@@ -517,7 +621,7 @@ function PatientDashboard({ user, doctors, appointments, onBook, medicines, phar
                         <div className="flex space-x-1">
                           {!isPending && (
                             <>
-                              <button onClick={() => setActiveChat({ name: doc?.name, info: doc?.spec, img: doc?.img, role: 'Dokter' })} className="p-1.5 bg-slate-50 text-slate-600 rounded hover:bg-slate-200 transition-colors" title="Kirim Pesan"><MessageCircle className="w-4 h-4" /></button>
+                              <button onClick={() => setActiveChat({ appointmentId: appt.id, name: doc?.name, info: doc?.spec, img: doc?.img, role: 'Dokter' })} className="p-1.5 bg-slate-50 text-slate-600 rounded hover:bg-slate-200 transition-colors" title="Kirim Pesan"><MessageCircle className="w-4 h-4" /></button>
                               <button onClick={() => setActiveVideo({ name: doc?.name, info: doc?.spec, img: doc?.img, role: 'Dokter' })} className="p-1.5 bg-blue-50 text-blue-600 rounded hover:bg-blue-200 transition-colors" title="Masuk Video Call"><Video className="w-4 h-4" /></button>
                             </>
                           )}
@@ -631,7 +735,7 @@ function PatientDashboard({ user, doctors, appointments, onBook, medicines, phar
         setPaymentData(null);
       }} onCancel={() => setPaymentData(null)} />}
       
-      {activeChat && <ChatModal partner={activeChat} onClose={() => setActiveChat(null)} />}
+      {activeChat && <ChatModal partner={activeChat} currentUser={user} onClose={() => setActiveChat(null)} />}
       {activeVideo && <VideoCallModal partner={activeVideo} onClose={() => setActiveVideo(null)} />}
     </div>
   );
@@ -692,7 +796,7 @@ function DoctorDashboard({ user, appointments, patients, onComplete }) {
                       </div>
                       <div className="flex flex-col space-y-2 sm:min-w-[140px] justify-center">
                         <div className="flex space-x-2">
-                           <button onClick={() => setActiveChat({ name: patient?.name, info: `${getAge(patient?.dob)} thn`, img: patient?.img, role: 'Pasien' })} className="flex-1 flex justify-center items-center px-3 py-2 text-sm bg-slate-100 text-slate-700 border border-slate-200 rounded-lg hover:bg-slate-200 font-medium transition-colors"><MessageCircle className="w-4 h-4 mr-1.5" /> Chat</button>
+                           <button onClick={() => setActiveChat({ appointmentId: appt.id, name: patient?.name, info: `${getAge(patient?.dob)} thn`, img: patient?.img, role: 'Pasien' })} className="flex-1 flex justify-center items-center px-3 py-2 text-sm bg-slate-100 text-slate-700 border border-slate-200 rounded-lg hover:bg-slate-200 font-medium transition-colors"><MessageCircle className="w-4 h-4 mr-1.5" /> Chat</button>
                            <button onClick={() => setActiveVideo({ name: patient?.name, info: `${getAge(patient?.dob)} thn`, img: patient?.img, role: 'Pasien' })} className="flex-1 flex justify-center items-center px-3 py-2 text-sm bg-blue-50 text-blue-700 border border-blue-200 rounded-lg hover:bg-blue-600 hover:text-white font-medium transition-colors"><Video className="w-4 h-4 mr-1.5" /> Video</button>
                         </div>
                         <button onClick={() => setActiveSession(appt)} className="w-full flex justify-center items-center px-4 py-2 text-sm bg-green-500 text-white rounded-lg hover:bg-green-600 font-medium transition-colors shadow-sm"><FileSignature className="w-4 h-4 mr-2" /> Selesaikan Sesi</button>
@@ -736,7 +840,7 @@ function DoctorDashboard({ user, appointments, patients, onComplete }) {
         </div>
       )}
 
-      {activeChat && <ChatModal partner={activeChat} onClose={() => setActiveChat(null)} />}
+      {activeChat && <ChatModal partner={activeChat} currentUser={user} onClose={() => setActiveChat(null)} />}
       {activeVideo && <VideoCallModal partner={activeVideo} onClose={() => setActiveVideo(null)} />}
     </div>
   );
@@ -837,34 +941,46 @@ function PaymentModal({ data, onConfirm, onCancel }) {
   );
 }
 
-function ChatModal({ partner, onClose }) {
+function ChatModal({ partner, currentUser, onClose }) {
   const [msg, setMsg] = useState('');
-  const [chats, setChats] = useState([
-    { id: 1, text: `Halo, ruang obrolan telah dibuka. Silakan sampaikan pesan Anda kepada ${partner.name}.`, sender: 'system', time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) }
-  ]);
+  const [chats, setChats] = useState([]);
   const messagesEndRef = useRef(null);
+
+  useEffect(() => {
+    if (!partner.appointmentId) return;
+    const q = query(
+      collection(db, 'artifacts', appId, 'public', 'data', 'tele_chats'), 
+      where('appointmentId', '==', partner.appointmentId)
+    );
+    
+    const unsub = onSnapshot(q, (snap) => {
+      const fetched = snap.docs.map(d => ({id: d.id, ...d.data()}));
+      // Mengurutkan pesan dari yang terlama ke terbaru berdasarkan waktu
+      fetched.sort((a, b) => a.createdAt - b.createdAt);
+      setChats(fetched);
+    });
+    
+    return () => unsub();
+  }, [partner.appointmentId]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chats]);
 
-  const handleSend = (e) => {
+  const handleSend = async (e) => {
     e.preventDefault();
     if(!msg.trim()) return;
     
-    const newChat = { id: Date.now(), text: msg, sender: 'me', time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) };
-    setChats(prev => [...prev, newChat]);
-    setMsg('');
+    const textToSend = msg;
+    setMsg(''); // Mengosongkan input seketika
     
-    // Simulate smart auto-reply
-    setTimeout(() => {
-      setChats(prev => [...prev, { 
-        id: Date.now()+1, 
-        text: partner.role === 'Dokter' ? 'Baik, keluhan Anda saya catat. Mari kita bahas lebih mendalam pada sesi video sebentar lagi ya.' : 'Baik Dok, terima kasih atas informasinya.', 
-        sender: 'partner', 
-        time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) 
-      }]);
-    }, 1500);
+    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'tele_chats'), {
+      appointmentId: partner.appointmentId,
+      senderId: currentUser.id,
+      text: textToSend,
+      createdAt: Date.now(),
+      timeStr: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})
+    });
   };
 
   return (
@@ -886,18 +1002,23 @@ function ChatModal({ partner, onClose }) {
 
       {/* Chat Area */}
       <div className="flex-1 bg-slate-50 p-4 overflow-y-auto space-y-4">
-        {chats.map(chat => (
-          <div key={chat.id} className={`flex flex-col ${chat.sender === 'me' ? 'items-end' : chat.sender === 'system' ? 'items-center' : 'items-start'}`}>
-            {chat.sender === 'system' ? (
-              <span className="text-[10px] bg-slate-200 text-slate-500 px-3 py-1 rounded-full mb-2">{chat.text}</span>
-            ) : (
-              <div className={`max-w-[80%] rounded-2xl p-3 text-sm shadow-sm ${chat.sender === 'me' ? 'bg-blue-600 text-white rounded-br-none' : 'bg-white border border-slate-200 text-slate-800 rounded-bl-none'}`}>
+        <div className="flex flex-col items-center">
+          <span className="text-[10px] bg-slate-200 text-slate-500 px-3 py-1 rounded-full mb-2 text-center">
+            Halo, ruang obrolan telah dibuka. Silakan sampaikan pesan Anda kepada {partner.name}.
+          </span>
+        </div>
+        
+        {chats.map(chat => {
+          const isMe = chat.senderId === currentUser.id;
+          return (
+             <div key={chat.id} className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}>
+              <div className={`max-w-[80%] rounded-2xl p-3 text-sm shadow-sm ${isMe ? 'bg-blue-600 text-white rounded-br-none' : 'bg-white border border-slate-200 text-slate-800 rounded-bl-none'}`}>
                 <p>{chat.text}</p>
               </div>
-            )}
-            {chat.sender !== 'system' && <span className="text-[10px] text-slate-400 mt-1">{chat.time}</span>}
-          </div>
-        ))}
+              <span className="text-[10px] text-slate-400 mt-1">{chat.timeStr}</span>
+            </div>
+          )
+        })}
         <div ref={messagesEndRef} />
       </div>
 
@@ -912,68 +1033,115 @@ function ChatModal({ partner, onClose }) {
   );
 }
 
-function VideoCallModal({ partner, onClose }) {
-  const [time, setTime] = useState(0);
-  const [isMuted, setIsMuted] = useState(false);
-  const [isCamOff, setIsCamOff] = useState(false);
+function EditProfileModal({ user, onClose, onSave }) {
+  const [name, setName] = useState(user.name || '');
+  const [phone, setPhone] = useState(user.phone || '');
+  const [password, setPassword] = useState(user.password || '');
+  const [dob, setDob] = useState(user.dob || '');
+  const [spec, setSpec] = useState(user.spec || '');
+  const [showPwd, setShowPwd] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [imgData, setImgData] = useState(user.img || '');
 
-  useEffect(() => {
-    const timer = setInterval(() => setTime(t => t + 1), 1000);
-    return () => clearInterval(timer);
-  }, []);
+  const handleImageChange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
 
-  const formatTime = (secs) => {
-    const m = Math.floor(secs / 60).toString().padStart(2, '0');
-    const s = (secs % 60).toString().padStart(2, '0');
-    return `${m}:${s}`;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const imgElement = new Image();
+      imgElement.onload = () => {
+        // Resize image secara otomatis agar sangat ringan saat disimpan ke database
+        const canvas = document.createElement('canvas');
+        const MAX_SIZE = 250; // Maksimal lebar/tinggi 250px
+        let width = imgElement.width;
+        let height = imgElement.height;
+
+        if (width > height && width > MAX_SIZE) {
+          height *= MAX_SIZE / width;
+          width = MAX_SIZE;
+        } else if (height > MAX_SIZE) {
+          width *= MAX_SIZE / height;
+          height = MAX_SIZE;
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(imgElement, 0, 0, width, height);
+        
+        // Convert gambar yang sudah diperkecil menjadi Base64 (Format JPEG)
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+        setImgData(dataUrl);
+      };
+      imgElement.src = event.target.result;
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setIsSaving(true);
+    const updatedData = { name, phone, password, img: imgData };
+    if (user.role === 'patient') updatedData.dob = dob;
+    if (user.role === 'doctor') updatedData.spec = spec;
+
+    // Update avatar default jika pengguna belum pernah upload foto sendiri tapi mengubah namanya
+    if (name !== user.name && imgData.includes('dicebear')) {
+      updatedData.img = `https://api.dicebear.com/7.x/avataaars/svg?seed=${name.replace(/\s+/g, '')}`;
+    }
+
+    try {
+      await onSave(user.id, updatedData);
+      onClose();
+    } catch (err) {
+      console.error(err);
+      setIsSaving(false);
+    }
   };
 
   return (
-    <div className="fixed inset-0 bg-slate-900/95 backdrop-blur-md flex items-center justify-center z-50 animate-in zoom-in-95 duration-200">
-      
-      {/* Main Video Area (Partner) */}
-      <div className="relative w-full h-full md:w-[80vw] md:h-[85vh] md:rounded-3xl bg-slate-800 overflow-hidden shadow-2xl border border-slate-700 flex flex-col items-center justify-center">
-        
-        {/* Top Info Bar */}
-        <div className="absolute top-0 inset-x-0 p-6 bg-gradient-to-b from-black/60 to-transparent flex justify-between items-center z-10 text-white">
-           <div>
-             <h2 className="text-xl font-bold flex items-center"><ShieldCheck className="w-5 h-5 text-green-400 mr-2"/> {partner.name}</h2>
-             <p className="text-sm text-slate-300">{partner.info}</p>
-           </div>
-           <div className="bg-black/40 px-3 py-1 rounded-full font-mono font-medium backdrop-blur-sm border border-white/10 flex items-center">
-             <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse mr-2"></span> {formatTime(time)}
-           </div>
+    <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-md overflow-hidden animate-in zoom-in-95">
+        <div className="bg-slate-50 p-4 border-b border-slate-200 flex justify-between items-center">
+          <h3 className="font-bold text-lg text-slate-800 flex items-center"><Settings className="w-5 h-5 mr-2 text-blue-600"/> Pengaturan Profil</h3>
+          {!isSaving && <button onClick={onClose} className="text-slate-400 hover:bg-slate-200 p-1 rounded-full"><X className="w-5 h-5"/></button>}
         </div>
-
-        {/* Simulated Partner Video Stream */}
-        <div className="relative flex flex-col items-center justify-center">
-          <div className="relative">
-            <div className="absolute inset-0 bg-blue-500 rounded-full animate-ping opacity-20 blur-xl scale-150"></div>
-            <img src={partner.img} alt={partner.name} className="w-40 h-40 md:w-56 md:h-56 rounded-full border-4 border-slate-600 bg-slate-700 object-cover relative z-10 shadow-2xl" />
+        <form onSubmit={handleSubmit} className="p-6 space-y-4 max-h-[85vh] overflow-y-auto">
+          
+          {/* Bagian Unggah Foto / Avatar */}
+          <div className="flex flex-col items-center justify-center mb-2">
+            <div className="relative group cursor-pointer">
+              <img src={imgData} alt="Profile" className="w-24 h-24 rounded-full border-4 border-blue-100 object-cover bg-slate-100" />
+              <label className="absolute inset-0 flex items-center justify-center bg-black/50 text-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer">
+                <Camera className="w-6 h-6" />
+                <input type="file" accept="image/*" className="hidden" onChange={handleImageChange} disabled={isSaving} />
+              </label>
+            </div>
+            <p className="text-xs text-slate-500 mt-2">Klik foto untuk mengunggah avatar</p>
           </div>
-          <p className="mt-8 text-slate-400 font-medium">Terhubung via koneksi aman...</p>
-        </div>
 
-        {/* Picture-in-Picture (Self Video) */}
-        {!isCamOff && (
-          <div className="absolute bottom-28 right-6 md:bottom-8 md:right-8 w-28 h-40 md:w-40 md:h-56 bg-slate-700 rounded-xl md:rounded-2xl border-2 border-slate-500 shadow-xl overflow-hidden z-20 flex items-center justify-center">
-             <User className="w-12 h-12 text-slate-500" />
-             <span className="absolute bottom-2 left-2 text-[10px] bg-black/50 text-white px-2 py-0.5 rounded-md">Anda</span>
+          <div><label className="block text-sm font-medium text-slate-700 mb-1">Nama Lengkap</label><input type="text" className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" value={name} onChange={e => setName(e.target.value)} required /></div>
+          <div><label className="block text-sm font-medium text-slate-700 mb-1">No. Telepon</label><input type="tel" className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" value={phone} onChange={e => setPhone(e.target.value)} required /></div>
+          
+          {user.role === 'patient' && (
+            <div><label className="block text-sm font-medium text-slate-700 mb-1">Tanggal Lahir</label><input type="date" className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" value={dob} onChange={e => setDob(e.target.value)} required /></div>
+          )}
+          {user.role === 'doctor' && (
+            <div><label className="block text-sm font-medium text-slate-700 mb-1">Spesialisasi</label><input type="text" className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" value={spec} onChange={e => setSpec(e.target.value)} required /></div>
+          )}
+          
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
+            <div className="relative">
+              <input type={showPwd ? "text" : "password"} className="w-full px-4 py-2 pr-10 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" value={password} onChange={e => setPassword(e.target.value)} required minLength={6} />
+              <button type="button" className="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-600" onClick={() => setShowPwd(!showPwd)}>
+                {showPwd ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
+              </button>
+            </div>
           </div>
-        )}
-
-        {/* Bottom Controls */}
-        <div className="absolute bottom-0 inset-x-0 p-6 md:pb-8 bg-gradient-to-t from-black/80 to-transparent flex justify-center items-center space-x-6 z-20">
-           <button onClick={() => setIsMuted(!isMuted)} className={`p-4 rounded-full transition-all shadow-lg ${isMuted ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-white'}`}>
-             {isMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
-           </button>
-           <button onClick={onClose} className="p-5 bg-red-600 hover:bg-red-700 text-white rounded-full transition-all shadow-lg shadow-red-500/20 transform hover:scale-105" title="Akhiri Panggilan">
-             <PhoneOff className="w-7 h-7" />
-           </button>
-           <button onClick={() => setIsCamOff(!isCamOff)} className={`p-4 rounded-full transition-all shadow-lg ${isCamOff ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-white'}`}>
-             {isCamOff ? <VideoOff className="w-6 h-6" /> : <Camera className="w-6 h-6" />}
-           </button>
-        </div>
+          <div className="pt-2"><button type="submit" disabled={isSaving} className="w-full bg-blue-600 text-white font-bold py-2.5 rounded-lg hover:bg-blue-700 disabled:opacity-50 flex justify-center items-center shadow-sm">{isSaving ? 'Menyimpan...' : 'Simpan Perubahan'}</button></div>
+        </form>
       </div>
     </div>
   );
